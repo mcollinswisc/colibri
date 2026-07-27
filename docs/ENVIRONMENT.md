@@ -108,7 +108,8 @@ See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=
 | `COLI_GPU` / `COLI_GPUS` | unset | Device selection (`auto`, `none`, or a list like `0,1`). Requires `COLI_CUDA=1`. |
 | `CUDA_DENSE` | `0` | Place dense (non-expert) matmuls on the GPU. |
 | `CUDA_EXPERT_GB` | `0` | VRAM budget (GB) for caching experts on the GPU. |
-| `CUDA_RELEASE_HOST` | auto (`1` if >1 device) | Release host-side copies after upload. |
+| `CUDA_RELEASE_HOST` | auto (`1` if >1 device, or 1 GPU with a large `PIN_GB` — #686) | Release host-side copies after upload. |
+| `CUDA_STAGE_GB` | `4` | Cap (GB) on host RAM held by in-flight upload staging when `CUDA_RELEASE_HOST=1`. The expert tier is read, uploaded and released one chunk at a time, so peak RSS during pin is chunk-sized instead of carrying the whole `CUDA_EXPERT_GB` — this is what lets the VRAM tier exceed host RAM. `0` stages the entire tier at once (the pre-`CUDA_STAGE_GB` behaviour). |
 | `COLI_CUDA_ATTN` | off | Run S≤4 attention on the GPU. |
 | `COLI_CUDA_ATTN_SHARD` | off | `=1` splits KV-b heads across devices during attention load (multi-GPU). |
 | `COLI_CUDA_PROFILE` | off | Emit CUDA timing. |

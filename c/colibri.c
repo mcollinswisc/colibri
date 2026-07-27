@@ -49,6 +49,9 @@
 #ifdef __linux__
 #include <sys/vfs.h>                              /* statfs: real fs-type check for the 9p warning (below) */
 #endif
+#ifdef __GLIBC__
+#include <malloc.h>                               /* mallopt: soglia mmap fissa per lo staging VRAM (pin_load) */
+#endif
 #if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
 #endif
@@ -5957,7 +5960,8 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
 #ifdef COLI_CUDA
         int cold=-1,hot=-1;
         for(int z=0;z<m->npin[l];z++){
-            ESlot *s=&m->pin[l][z]; uint32_t heat=m->eheat[l][s->eid];
+            ESlot *s=&m->pin[l][z]; if(s->eid<0) continue;   /* slot nascosto: eheat[-1] = OOB */
+            uint32_t heat=m->eheat[l][s->eid];
             if(s->g.cuda_eligible){
                 if(cold<0||heat<m->eheat[l][m->pin[l][cold].eid]) cold=z;
             }else if(hot<0||heat>m->eheat[l][m->pin[l][hot].eid]) hot=z;
@@ -5973,11 +5977,15 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
             }
         }
 #endif
-        ESlot *P=m->pin[l]; int ids[4096], zp, eu; long g;
-        int np=m->npin[l]; if(np>4096) np=4096;
-        for(int z=0;z<np;z++) ids[z]=P[z].eid;
+        ESlot *P=m->pin[l]; int ids[4096], zmap[4096], zp, eu; long g;
+        int cap=m->npin[l]; if(cap>4096) cap=4096;
+        /* compatta saltando gli slot nascosti (eid<0): tier_pick_lfru indicizza
+         * heat[pinned[z]] senza controlli, e riporta un indice DENTRO ids[] —
+         * zmap[] lo ritraduce nell'indice di slot vero. */
+        int np=0; for(int z=0;z<cap;z++) if(P[z].eid>=0){ ids[np]=P[z].eid; zmap[np]=z; np++; }
         if(!tier_pick_lfru(m->eheat[l],m->elast[l],m->eaccess_clock,
                            c->n_experts,ids,np,&zp,&eu,&g)) continue;
+        zp=zmap[zp];
         if(nb<maxc){ out[nb]=(RepinCand){g,l,zp,eu,0}; nb++; }
         else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain) w=b;
                if(g>out[w].gain) out[w]=(RepinCand){g,l,zp,eu,0}; }
@@ -7158,6 +7166,57 @@ static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
 }
 
+#ifdef COLI_CUDA
+/* Carica sul device set i rank di pin [lo,hi), liberando lo slab host appena la
+ * copia e' atterrata (CUDA_RELEASE_HOST). Estratto dal corpo del vecchio loop
+ * unico di pin_load per poter essere chiamato UNA VOLTA PER BLOCCO dallo staging
+ * incrementale. Ritorna 1 quando il budget VRAM e' esaurito o nessun device
+ * accetta piu' nulla: e' il segnale allo staging di smettere di leggere expert
+ * che non potra' comunque piazzare (senza, il prefisso restante finirebbe in RAM
+ * ed e' esattamente l'OOM che lo staging a blocchi esiste per evitare).
+ * EN: upload pin ranks [lo,hi), releasing each host slab as its copy lands.
+ * Returns 1 once the VRAM budget is spent (or every device refuses), so chunked
+ * staging stops reading experts it can no longer place. */
+static int pin_gpu_upload(Model *m, PinRec *r, int *slot_of, double budget,
+                          double *remaining, double *placed_b, int *placed_n,
+                          int lo, int hi){
+    for(int a=lo; a<hi; a++){
+        if(m->gpu_expert_bytes>=budget) return 1;
+        ESlot *s=&m->pin[r[a].l][slot_of[a]];
+        int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+        if(m->gpu_expert_bytes+need>budget) return 1;
+        int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
+        for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
+            int best=-1;
+            for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
+                (best<0||placed_b[i]<placed_b[best])) best=i;
+            if(best<0) break;
+            tried[best]=1;
+            s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
+            s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+            if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                              +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                              +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
+                remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
+                if(g_cuda_release_host) expert_host_release(m,s);
+                placed=1;
+            } else {
+                qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                remaining[best]=0;             /* device rejected its projected capacity */
+            }
+        }
+        if(!placed){
+            int any=0; for(int i=0;i<g_cuda_ndev;i++) if(remaining[i]>0){ any=1; break; }
+            if(!any) return 1;                 /* ogni device pieno/refrattario: inutile insistere */
+        }
+    }
+    return 0;
+}
+#endif
+
 #ifdef __linux__
 /* #419: bind the pinned hot-store as ONE arena per layer instead of one mbind
  * per slab. Per-slab policies cost ~2 unmergeable VMAs each; a PIN_GB=all load
@@ -7278,7 +7337,18 @@ static void pin_load(Model *m, const char *statspath, double gb){
     if(npin<1){ free(r); return; }
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
     for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
-    for(int i=0;i<=c->n_layers;i++) if(cnt_l[i]) m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
+    /* eid=-1 = slot NASCOSTO, la stessa convenzione della LRU (vedi evict piu' sotto):
+     * calloc lascerebbe eid=0, e uno slot mai caricato verrebbe scambiato per l'expert 0
+     * da OGNI lookup `P[z].eid==eid` (pesi NULL). Con lo staging VRAM a blocchi la coda
+     * del prefisso puo' restare non caricata se la VRAM si riempie prima, quindi i buchi
+     * ora sono possibili davvero.
+     * EN: hidden-slot sentinel. calloc would leave eid=0, so a never-loaded slot would
+     * false-hit expert 0 in every `P[z].eid==eid` pin lookup with NULL weights. Chunked
+     * VRAM staging can genuinely leave an unfilled tail, so holes are now reachable. */
+    for(int i=0;i<=c->n_layers;i++) if(cnt_l[i]){
+        m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
+        for(int z=0;z<cnt_l[i];z++) m->pin[i][z].eid=-1;
+    }
     int *slot_of=malloc((size_t)npin*sizeof(int)), *next=calloc(c->n_layers+1,sizeof(int));
     for(int a=0;a<npin;a++) slot_of[a]=next[r[a].l]++;
     for(int i=0;i<=c->n_layers;i++) m->npin[i]=cnt_l[i];
@@ -7298,46 +7368,64 @@ static void pin_load(Model *m, const char *statspath, double gb){
 #ifdef __linux__
     if(gpu_prefix>0) g_numa_skip_bind=1;   /* prefix slabs = transient upload staging: don't bind (#419) */
 #endif
-    #pragma omp parallel for schedule(dynamic,1)
-    for(int a=0;a<(gpu_prefix?gpu_prefix:npin);a++)
-        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
+    int staged_hi=0;                       /* rank [0,staged_hi) effettivamente letti dal disco */
+#ifdef COLI_CUDA
+    if(gpu_prefix>0){
+        /* STAGING A BLOCCHI. Prima il prefisso VRAM veniva letto in RAM TUTTO in un
+         * colpo solo e solo dopo partiva il loop di upload+release: il picco di RSS
+         * portava l'INTERO CUDA_EXPERT_GB prima che un solo byte tornasse indietro,
+         * quindi era la RAM host — non la VRAM — a fissare il tetto del tier (misurato
+         * su 96 GB di scheda / 62 GB di host: --vram 45 OOM-killed durante il pin).
+         * Caricando -> caricando su device -> rilasciando un blocco alla volta il picco
+         * diventa grande quanto il blocco e la VRAM si riempie per davvero.
+         * EN: chunked staging. The prefix used to be read into host RAM in one pass
+         * before any upload, so peak RSS carried the whole CUDA_EXPERT_GB and host RAM,
+         * not VRAM, was the ceiling. One bounded chunk at a time makes the peak
+         * chunk-sized instead. CUDA_STAGE_GB=0 restores the old single-shot staging. */
+        double stage_gb=getenv("CUDA_STAGE_GB")?atof(getenv("CUDA_STAGE_GB")):4.0;
+        int chunk = stage_gb>0 ? (int)(stage_gb*1e9/(double)eb) : gpu_prefix;
+        int nthr=omp_get_max_threads(); if(nthr<1) nthr=1;
+        if(chunk < 2*nthr) chunk = 2*nthr;               /* tieni occupato ogni thread di lettura */
+        if(chunk > gpu_prefix) chunk = gpu_prefix;
+#ifdef __GLIBC__
+        /* Senza questo lo staging a blocchi NON restituisce niente al kernel: gli slab
+         * sono ~19 MB, quindi arrivano da mmap, ma glibc ALZA mmap_threshold alla taglia
+         * del primo blocco mmappato che libera (fino a 32 MB). Dopo la prima release le
+         * allocazioni successive cadono nell'arena e non tornano piu' all'OS: la RSS
+         * cresce di blocco in blocco e la modifica sembra non funzionare. mallopt fissa
+         * la soglia e disattiva l'euristica dinamica. */
+        mallopt(M_MMAP_THRESHOLD, 1<<20);
+        mallopt(M_TRIM_THRESHOLD, 4<<20);
+#endif
+        int full=0;
+        for(int c0=0;c0<gpu_prefix && !full;c0+=chunk){
+            int c1=c0+chunk; if(c1>gpu_prefix) c1=gpu_prefix;
+            #pragma omp parallel for schedule(dynamic,1)
+            for(int a=c0;a<c1;a++)
+                expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
+            m->resident_bytes+=(int64_t)(c1-c0)*eb;
+            staged_hi=c1;
+            if(g_cuda_enabled && budget>0)
+                full=pin_gpu_upload(m,r,slot_of,budget,remaining,placed_b,placed_n,c0,c1);
+        }
+    } else
+#endif
+    {
+        #pragma omp parallel for schedule(dynamic,1)
+        for(int a=0;a<npin;a++)
+            expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
+        m->resident_bytes+=(int64_t)npin*eb;
+        staged_hi=npin;
+#ifdef COLI_CUDA
+        if(g_cuda_enabled && budget>0)
+            pin_gpu_upload(m,r,slot_of,budget,remaining,placed_b,placed_n,0,npin);
+#endif
+    }
 #ifdef __linux__
     g_numa_skip_bind=0;
 #endif
-    m->resident_bytes+=(int64_t)(gpu_prefix?gpu_prefix:npin)*eb;
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
-        int gpu_limit=gpu_prefix?gpu_prefix:npin;
-        for(int a=0;a<gpu_limit && m->gpu_expert_bytes<budget;a++){
-            int li=r[a].l;
-            { ESlot *s=&m->pin[li][slot_of[a]];
-                int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
-                if(m->gpu_expert_bytes+need>budget) break;
-                int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
-                for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
-                    int best=-1;
-                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
-                        (best<0||placed_b[i]<placed_b[best])) best=i;
-                    if(best<0) break;
-                    tried[best]=1;
-                    s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
-                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-                    if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
-                        int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
-                        m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
-                        remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
-                        if(g_cuda_release_host) expert_host_release(m,s);
-                        placed=1;
-                    } else {
-                        qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
-                        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
-                        remaining[best]=0;             /* device rejected its projected capacity */
-                    }
-                }
-            }
-        }
         fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (budget %.1f GB%s, reserve %.1f GB)\n",
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,
             g_cuda_expert_auto?safe_total/1e9:budget/1e9,
@@ -7370,8 +7458,17 @@ static void pin_load(Model *m, const char *statspath, double gb){
             expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
         m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
     }
+    /* Rank [staged_hi,gpu_prefix): la VRAM si e' riempita prima della fine del prefisso,
+     * quindi non sono mai stati letti. NON diventano pin RAM — npin era stato gonfiato di
+     * prefix_est sulla promessa che il prefisso venisse rilasciato, riempirli sarebbe
+     * l'OOM di partenza. Restano slot nascosti (eid=-1): ogni lookup li manca e la LRU
+     * serve quegli expert da disco. */
+    int holes = gpu_prefix>staged_hi ? gpu_prefix-staged_hi : 0;
+    int ram_pin = npin-m->gpu_expert_count-holes;
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
-        m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
+        m->gpu_expert_count,ram_pin,ram_pin*eb/1e9,now_s()-t0,statspath);
+    if(holes) fprintf(stderr,"[PIN] %d ranked expert left unplaced: the VRAM budget ran out "
+        "before the end of the GPU prefix (they stay on disk, served by the LRU)\n",holes);
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l); free(slot_of); free(next);
 }

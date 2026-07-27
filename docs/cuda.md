@@ -50,6 +50,28 @@ whole to the least-loaded device that can hold them. Multi-GPU runs default to
 experts) and `CUDA_RELEASE_HOST=1` (RAM copy released after upload, reloaded
 from disk only if CUDA later fails).
 
+The VRAM tier does **not** need host RAM to match it. Under `CUDA_RELEASE_HOST=1`
+experts are read, uploaded and released one `CUDA_STAGE_GB` chunk at a time
+(default 4 GB), so peak host RSS during the pin is `dense + runtime + one chunk` —
+a 96 GB card fills on a 62 GB host. `CUDA_STAGE_GB=0` restores the old behaviour of
+staging the whole tier into RAM before the first upload, which made host RAM rather
+than VRAM the real ceiling.
+
+A tier that large is worth pairing with an explicit `CUDA_EXPERT_GB` rather than
+`auto`: resident experts carry a per-expert VRAM cost that the auto budget does not
+model ([#687](https://github.com/JustVugg/colibri/issues/687) measures ~0.74 MB each),
+so the more experts staging lets you place, the more likely the lazily-uploaded dense
+tensors are to fail and fall back to CPU. Watch for the `[CUDA] … resident tensors
+have been disabled` line, and raise `CUDA_RESERVE_GB` if it appears.
+
+Single-GPU hosts need `CUDA_RELEASE_HOST` to be **on** for any of that, and whether
+it defaults on depends on how you ask. Since [#686](https://github.com/JustVugg/colibri/issues/686)
+one GPU plus an expert tier plus a large `PIN_GB` (`all`, or ≥ the tier) opts in
+automatically and says so on stderr. A run that sets no `PIN_GB` does not qualify —
+including `coli chat --vram N --ram M`, which maps `--vram` to `CUDA_EXPERT_GB` and
+leaves `PIN_GB` unset. There, set `CUDA_RELEASE_HOST=1` yourself or the tier is
+silently capped by the RAM pin.
+
 `CUDA_EXPERT_GB=auto` fills each device up to measured free memory minus
 projected dense tensors and headroom. `PIN_GB=all` then loads the remaining
 routed experts into RAM **up to the `--ram` budget** (it clamps — [#229](https://github.com/JustVugg/colibri/issues/229)),
