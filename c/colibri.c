@@ -8134,6 +8134,17 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     free(seen);
     qsort(r,(size_t)n,sizeof(*r),pin_rec_cmp);
     int64_t eb=expert_bytes_probe(m,m->ebits);
+#ifdef COLI_CUDA
+    /* Routed width for the VRAM staging prefix: those slabs are freed the moment the
+     * upload lands, so they never migrate between rows and never hold the MTP head.
+     * Sizing them with the widest width (eb, above) under-fills the tier by the ratio.
+     * Identical to eb on a single-width container.
+     *
+     * eb stays for everything that remains host-resident (npin, expert_avail). That
+     * over-counts on a mixed container now that #869 shrinks slabs, but over-counting
+     * is the safe direction for the RSS guard and #869 deferred correcting it. */
+    int64_t ebr=expert_bytes_row(m,c->first_dense,m->ebits);
+#endif
     /* PIN_GB=all (#80): NON "tutti" alla lettera. Pinnare l'intero set ignora il
      * budget --ram e fa OOM-kill del kernel a meta' generazione (#229: host 92 GB
      * ucciso con --ram 78, anon-rss 89 GB). Clampa a quanti expert entrano nel
@@ -8173,12 +8184,12 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
      * tier under CUDA_DENSE=1 regardless of the configured budget (#491). */
     if(g_cuda_expert_auto) budget=safe_total;
     if(g_cuda_enabled&&g_cuda_release_host&&budget>0){
-        prefix_est=(int)(budget/eb)+g_cuda_ndev;
+        prefix_est=(int)(budget/ebr)+g_cuda_ndev;
 #ifdef COLI_ANS
         if(g_cuda_raw_experts>=0){
             int raw=g_cuda_raw_experts;
-            if((double)raw*eb>budget) raw=(int)(budget/eb);
-            prefix_est=raw+(int)((budget-(double)raw*eb)/(0.80*eb))+g_cuda_ndev;
+            if((double)raw*ebr>budget) raw=(int)(budget/ebr);
+            prefix_est=raw+(int)((budget-(double)raw*ebr)/(0.80*ebr))+g_cuda_ndev;
         }
 #endif
         npin+=prefix_est;                       /* additive: prefix RAM is returned after upload */
@@ -8226,24 +8237,37 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
          * i thread del carico parallelo; il tetto assoluto protegge chi ha poca RAM
          * e un budget enorme, che e' esattamente il caso segnalato. */
         double cap = 4e9; if(budget/8.0 < cap) cap = budget/8.0;
-        int st = (int)(cap/eb);
+        int st = (int)(cap/ebr);
         if(st < 1) st = 1;
         if(st < stage) stage = st;
         if(stage < pre_n)
             fprintf(stderr,"[CUDA] tier staging: %d experts per round (%.1f GB host peak) "
                            "instead of %d at once (%.1f GB) — CUDA_RELEASE_HOST frees each "
                            "round before the next (#730)\n",
-                    stage, stage*eb/1e9, pre_n, pre_n*eb/1e9);
+                    stage, stage*ebr/1e9, pre_n, pre_n*ebr/1e9);
     }
 #endif
-    for(int base=0; base<pre_n; base+=stage){
+    /* Primo rank NON caricato: pre_n se il ciclo arriva in fondo, altrimenti dove la
+     * VRAM si e' riempita. Il suffisso RAM riparte da qui, cosi' nessuno slot resta
+     * senza slab. */
+    int staged_hi=pre_n, vram_full=0;
+    for(int base=0; base<pre_n && !vram_full; base+=stage){
     int hi = base+stage; if(hi>pre_n) hi=pre_n;
     #pragma omp parallel for schedule(dynamic,1)
     for(int a=base;a<hi;a++)
         expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
-    m->resident_bytes+=(int64_t)(hi-base)*eb;
+    /* Conta i byte VERI, non stage*eb: expert_host_release() sotto sottrae qt_bytes,
+     * e una stima piu' larga della realta' lascerebbe residuo fantasma a ogni release
+     * (16.56 MB per expert su GLM-5.2 g64: ~75 GB a tier pieno, abbastanza da far
+     * rifiutare l'avvio a un run il cui VmHWM reale e' 23 GB). Stesso conto del
+     * percorso gpu_swap di REPIN. */
+    { int64_t staged_b=0;
+      for(int a=base;a<hi;a++){ ESlot *s=&m->pin[r[a].l][slot_of[a]];
+          staged_b+=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d); }
+      m->resident_bytes+=staged_b; }
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
+        int placed_before=m->gpu_expert_count;
         for(int a=base;a<hi && m->gpu_expert_bytes<budget;a++){
             int li=r[a].l;
             { ESlot *s=&m->pin[li][slot_of[a]];
@@ -8295,6 +8319,12 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                 }
             }
         }
+        /* Un round che non piazza NULLA vuol dire che il tier non cresce piu': budget
+         * esaurito, il prossimo expert non ci sta, o tutti i device hanno rifiutato.
+         * Senza questo il ciclo continuava a leggere round in RAM host che nessuno
+         * poi rilascia -- latente finche' prefix_est sottostimava, raggiungibile ora
+         * che e' dimensionato sulla larghezza giusta. */
+        if(m->gpu_expert_count==placed_before){ vram_full=1; staged_hi=hi; }
     }
 #endif
     }   /* fine del ciclo a round (#730) */
@@ -8331,14 +8361,31 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
         }
     }
 #endif
-    if(gpu_prefix>0&&gpu_prefix<npin){
+    /* Suffisso RAM: da staged_hi, non da gpu_prefix. Coincidono quando il prefisso e'
+     * stato messo tutto in VRAM; se il tier si e' riempito prima, i rank [staged_hi,
+     * gpu_prefix) diventano semplici pin in RAM invece di restare slot vuoti (eid 0,
+     * slab NULL) che ogni lookup scambierebbe per l'expert 0. Niente arena NUMA per
+     * loro -- pin_arena_bind copre [gpu_prefix,npin) -- quindi cadono sull'alloc
+     * individuale, lo stesso percorso che il prefisso usa comunque. */
+    if(staged_hi<npin){
         #pragma omp parallel for schedule(dynamic,1)
-        for(int a=gpu_prefix;a<npin;a++)
+        for(int a=staged_hi;a<npin;a++)
             expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
-        m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
+        int64_t suffix_b=0;
+        for(int a=staged_hi;a<npin;a++){ ESlot *s=&m->pin[r[a].l][slot_of[a]];
+            suffix_b+=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d); }
+        m->resident_bytes+=suffix_b;
     }
+    /* Byte reali, non conteggio x larghezza massima: #869 ha corretto TIERS,
+     * [PROF] resident experts e [PROF] config per la stessa ragione, ma questa riga
+     * vive dentro pin_load() e non era stata toccata. expert_host_release() azzera
+     * s->slab, quindi "slab non NULL" e' esattamente "ancora residente in RAM": il
+     * conto si corregge da solo qualunque cosa CUDA_RELEASE_HOST abbia liberato. */
+    int64_t ram_b=0;
+    for(int a=0;a<npin;a++){ ESlot *s=&m->pin[r[a].l][slot_of[a]];
+        if(s->slab) ram_b+=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d); }
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
-        m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
+        m->gpu_expert_count,npin-m->gpu_expert_count,ram_b/1e9,now_s()-t0,statspath);
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l); free(slot_of); free(next);
 }

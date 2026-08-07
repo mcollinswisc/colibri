@@ -45,9 +45,16 @@ static int64_t expert_bytes_layer(Model *m, int layer){
  * nsp += 2 in cap_for_ram() already nods at the MTP row costing double, but that
  * corrects one row out of nsp; the slabs grow on all of them.
  *
- * #856 SCOPE: this is the right width for the ws[64] working set, whose slots ARE
- * shared across rows, and for nothing else. Sizing the per-row LRU caches with it
- * is what expert_cache_row_bytes() below replaces. */
+ * #856 SCOPE: this is the right width for a slot REUSED ACROSS ROWS -- the ws[64]
+ * working set, and the host-resident pin slots pin_load() sizes with it. Sizing the
+ * per-row LRU caches with it is what expert_cache_row_bytes() below replaces.
+ *
+ * It is also wrong for a slot holding exactly one ROUTED expert. The VRAM staging
+ * prefix frees its slabs immediately after upload, so they never migrate and never
+ * hold the MTP head: dividing the tier budget by this under-fills it by the width
+ * ratio (96 GB asked, 54 GB placed), and crediting resident_bytes with it leaks the
+ * difference, since expert_host_release() debits the true qt_bytes. That caller
+ * wants expert_bytes_row() at c->first_dense. */
 static int64_t expert_bytes_probe(Model *m, int ebits){
     Cfg *c=&m->c;
     int64_t eb=expert_bytes_layer(m,c->first_dense);
